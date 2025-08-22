@@ -150,9 +150,14 @@ def main():
     logger.info(f"训练集样本数: {len(TRAIN_DATASET)}, 验证集样本数: {len(VAL_DATASET)}")
 
     # 初始化模型
+    # 在模型初始化部分修改损失函数的创建方式
     if args.model == 'pointnet2_sem_seg':
         model = pointnet2_sem_seg.get_model(NUM_CLASSES)
-        criterion = pointnet2_sem_seg.get_loss()
+        # 使用带权重的损失函数，传入计算好的类别权重
+        criterion = pointnet2_sem_seg.get_loss_function(
+            weight=torch.FloatTensor(TRAIN_DATASET.label_weights).cuda() if args.cuda else torch.FloatTensor(
+                TRAIN_DATASET.label_weights)
+        )
     else:
         logger.error(f"未知模型: {args.model}")
         return
