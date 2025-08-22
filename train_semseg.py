@@ -13,7 +13,6 @@ import os
 import argparse
 import logging
 from tqdm import tqdm
-from tensorboardX import SummaryWriter
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -228,9 +227,6 @@ def main():
             all_preds.append(pred_choice.cpu().numpy())
             all_targets.append(target.cpu().numpy())
 
-            # 每10个批次记录一次
-            if i % 10 == 0:
-                writer.add_scalar('train/batch_loss', loss.item(), epoch * len(train_loader) + i)
 
         # 计算平均损失和准确率
         avg_loss = total_loss / len(train_loader.dataset)
@@ -246,13 +242,6 @@ def main():
         logger.info(f"  损失: {avg_loss:.4f}, 准确率: {avg_acc:.4f}")
         logger.info(f"  每个类别的IOU: {[f'{iou:.4f}' for iou in class_ious]}")
         logger.info(f"  平均IOU: {miou:.4f}")
-
-        # TensorBoard记录
-        writer.add_scalar('train/avg_loss', avg_loss, epoch)
-        writer.add_scalar('train/avg_acc', avg_acc, epoch)
-        writer.add_scalar('train/miou', miou, epoch)
-        for cls in range(NUM_CLASSES):
-            writer.add_scalar(f'train/iou_cls_{cls}', class_ious[cls], epoch)
 
         return avg_loss, avg_acc, miou
 
@@ -302,13 +291,6 @@ def main():
         logger.info(f"  损失: {avg_loss:.4f}, 准确率: {avg_acc:.4f}")
         logger.info(f"  每个类别的IOU: {[f'{iou:.4f}' for iou in class_ious]}")
         logger.info(f"  平均IOU: {miou:.4f}")
-
-        # TensorBoard记录
-        writer.add_scalar('val/avg_loss', avg_loss, epoch)
-        writer.add_scalar('val/avg_acc', avg_acc, epoch)
-        writer.add_scalar('val/miou', miou, epoch)
-        for cls in range(NUM_CLASSES):
-            writer.add_scalar(f'val/iou_cls_{cls}', class_ious[cls], epoch)
 
         return avg_loss, avg_acc, miou
 
