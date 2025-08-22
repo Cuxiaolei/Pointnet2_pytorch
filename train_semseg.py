@@ -196,18 +196,19 @@ def main():
         for i, (points, target) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch} 训练")):
             if args.cuda:
                 points = points.cuda()
-                target = target.cuda()
+                target = target.cuda()  # target形状: [B, N] 其中N是点数量
 
             optimizer.zero_grad()
-            pred, trans_feat = model(points)
-            pred = pred.transpose(2, 1).contiguous()
+            pred, trans_feat = model(points)  # pred形状: [B, C, N] 其中C是类别数
+            # 语义分割需要将预测结果转换为 [B, N, C] 才能与 [B, N] 的target计算交叉熵
+            pred = pred.transpose(1, 2).contiguous()  # 调整为 [B, N, C]
             loss = criterion(pred, target, trans_feat)
 
             loss.backward()
             optimizer.step()
 
             # 计算准确率
-            pred_choice = pred.data.max(2)[1]
+            pred_choice = pred.data.max(2)[1]  # [B, N]
             correct = pred_choice.eq(target.data).cpu().sum()
             total_correct += correct.item()
             total_points += target.size(0) * target.size(1)
