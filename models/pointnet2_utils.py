@@ -314,3 +314,39 @@ class PointNetFeaturePropagation(nn.Module):
             new_points = F.relu(bn(conv(new_points)))
         return new_points
 
+
+# 添加特征插值函数，用于特征传播阶段
+def feature_interpolation(xyz1, xyz2, points2):
+    """
+    特征插值：将xyz2上的特征points2插值到xyz1上
+    Input:
+        xyz1: 目标点云坐标 [B, 3, N]
+        xyz2: 源点云坐标 [B, 3, M]
+        points2: 源点云特征 [B, C, M]
+    Return:
+        points1: 插值后的目标点云特征 [B, C, N]
+    """
+    # 转换维度以适应距离计算函数 [B, N, 3] 和 [B, M, 3]
+    xyz1 = xyz1.permute(0, 2, 1)
+    xyz2 = xyz2.permute(0, 2, 1)
+
+    # 计算距离
+    dist = square_distance(xyz1, xyz2)  # [B, N, M]
+
+    # 取最近的3个点进行插值
+    dist, idx = dist.sort(dim=-1)
+    dist, idx = dist[:, :, :3], idx[:, :, :3]  # [B, N, 3]
+
+    # 距离倒数作为权重（避免除以零）
+    dist_reciprocal = 1.0 / (dist + 1e-8)
+    norm = torch.sum(dist_reciprocal, dim=2, keepdim=True)
+    weight = dist_reciprocal / norm  # [B, N, 3]
+
+    # 索引并加权求和
+    points2 = points2.permute(0, 2, 1)  # [B, M, C]
+    interpolated_points = torch.sum(
+        index_points(points2, idx) * weight.view(weight.shape[0], weight.shape[1], weight.shape[2], 1),
+        dim=2)  # [B, N, C]
+
+    # 转换回原维度 [B, C, N]
+    return interpolated_points.permute(0, 2, 1)
