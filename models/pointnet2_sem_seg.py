@@ -32,8 +32,11 @@ class get_model(nn.Module):
             nn.BatchNorm1d(64),
             nn.ReLU()
         )
+        # 关键修复：调整fp1的输入通道数
+        # 原l0_points是6通道(3颜色+3法向量)，l1_points_interpolated是64通道
+        # 6 + 64 = 70，所以输入通道数应为70
         self.fp1 = nn.Sequential(
-            nn.Conv1d(64 + 9, 64, 1),
+            nn.Conv1d(70, 64, 1),  # 修复这里的输入通道数
             nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.Conv1d(64, num_class, 1)
@@ -41,8 +44,8 @@ class get_model(nn.Module):
 
     def forward(self, xyz):
         # Set Abstraction layers
-        l0_xyz = xyz[:, :3, :]  # [B, 3, N]
-        l0_points = xyz[:, 3:, :]  # [B, 6, N] - 颜色+法向量
+        l0_xyz = xyz[:, :3, :]  # [B, 3, N] - 坐标
+        l0_points = xyz[:, 3:, :]  # [B, 6, N] - 颜色+法向量（6通道）
 
         # 下采样阶段
         l1_xyz, l1_points = self.sa1(l0_xyz, l0_points)  # [B, 3, 1024], [B, 64, 1024]
@@ -50,20 +53,16 @@ class get_model(nn.Module):
         l3_xyz, l3_points = self.sa3(l2_xyz, l2_points)  # [B, 3, 64], [B, 256, 64]
         l4_xyz, l4_points = self.sa4(l3_xyz, l3_points)  # [B, 3, 16], [B, 512, 16]
 
-        # 特征传播阶段（添加上采样操作）
-        # 将l4特征上采样到l3的维度
+        # 特征传播阶段
         l4_points_interpolated = feature_interpolation(l3_xyz, l4_xyz, l4_points)  # [B, 512, 64]
         l3_points = self.fp4(torch.cat([l3_points, l4_points_interpolated], dim=1))  # [B, 256, 64]
 
-        # 将l3特征上采样到l2的维度
         l3_points_interpolated = feature_interpolation(l2_xyz, l3_xyz, l3_points)  # [B, 256, 256]
         l2_points = self.fp3(torch.cat([l2_points, l3_points_interpolated], dim=1))  # [B, 128, 256]
 
-        # 将l2特征上采样到l1的维度
         l2_points_interpolated = feature_interpolation(l1_xyz, l2_xyz, l2_points)  # [B, 128, 1024]
         l1_points = self.fp2(torch.cat([l1_points, l2_points_interpolated], dim=1))  # [B, 64, 1024]
 
-        # 将l1特征上采样到l0的维度
         l1_points_interpolated = feature_interpolation(l0_xyz, l1_xyz, l1_points)  # [B, 64, N]
         l0_points = self.fp1(torch.cat([l0_points, l1_points_interpolated], dim=1))  # [B, num_class, N]
 
