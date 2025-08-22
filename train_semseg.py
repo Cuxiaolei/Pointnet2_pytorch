@@ -3,13 +3,20 @@ import os
 import torch
 import torch.nn.parallel
 import torch.utils.data
-import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
-import sys
-from tqdm import tqdm
 import datetime
-import logging
 from pathlib import Path
+# 在文件开头添加NumPy导入
+import numpy as np
+import torch
+import os
+import argparse
+import logging
+from tqdm import tqdm
+from tensorboardX import SummaryWriter
+import sys
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 
 # 导入模型和数据集
 from models import pointnet2_sem_seg
