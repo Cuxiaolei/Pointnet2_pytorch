@@ -51,17 +51,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def add_vote(vote_label_pool, point_idx, pred_label, weight):
-    """累积投票结果"""
-    B = pred_label.shape[0]
-    N = pred_label.shape[1]
-    for b in range(B):
-        for n in range(N):
-            if weight[b, n] != 0 and not np.isinf(weight[b, n]):
-                vote_label_pool[int(point_idx[b, n]), int(pred_label[b, n])] += 1
-    return vote_label_pool
-
-
 def main(args):
     def log_string(str):
         logger.info(str)
@@ -108,6 +97,13 @@ def main(args):
         sample_rate=1.0,
         transform=False
     )
+    test_loader = torch.utils.data.DataLoader(
+        TEST_DATASET,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True if args.cuda else False
+    )
     log_string(f"测试集样本数: {len(TEST_DATASET)}")
 
     # 加载模型（与训练代码一致）
@@ -136,88 +132,54 @@ def main(args):
         total_correct_class = [0] * NUM_CLASSES
         total_iou_deno_class = [0] * NUM_CLASSES
 
-        log_string('---- 开始全场景评估 ----')
+        # 用于存储所有预测和标签
+        all_preds = []
+        all_targets = []
+        all_points = []
 
-        # 遍历测试数据
-        for scene_idx in range(len(TEST_DATASET)):
-            scene_name = f"scene_{scene_idx}"
-            log_string(f"处理场景 [{scene_idx + 1}/{len(TEST_DATASET)}]: {scene_name}")
+        log_string('---- 开始测试评估 ----')
 
-            # 获取完整场景数据（假设CustomSemSegDataset实现了这些方法）
-            whole_scene_data = TEST_DATASET.get_whole_scene(scene_idx)
-            whole_scene_label = TEST_DATASET.get_whole_scene_labels(scene_idx)
-            vote_label_pool = np.zeros((whole_scene_label.shape[0], NUM_CLASSES))
+        # 批次处理测试数据
+        for batch_idx, (points, target) in enumerate(tqdm(test_loader, desc="测试进度")):
+            if args.cuda:
+                points = points.cuda()
+                target = target.cuda()
 
             # 多轮投票
-            for _ in tqdm(range(args.num_votes), desc="投票轮次"):
-                # 获取场景的分块数据
-                scene_blocks, scene_block_labels, scene_block_smpw, scene_block_indices = TEST_DATASET.get_scene_blocks(scene_idx)
-                num_blocks = len(scene_blocks)
-                s_batch_num = (num_blocks + BATCH_SIZE - 1) // BATCH_SIZE
+            pred_sum = None
+            for _ in range(args.num_votes):
+                # 模型推理
+                seg_pred, _ = model(points.transpose(2, 1))  # [B, C, N]
+                if pred_sum is None:
+                    pred_sum = seg_pred
+                else:
+                    pred_sum += seg_pred
 
-                # 批次处理
-                for sbatch in range(s_batch_num):
-                    start_idx = sbatch * BATCH_SIZE
-                    end_idx = min((sbatch + 1) * BATCH_SIZE, num_blocks)
-                    real_batch_size = end_idx - start_idx
+            # 平均投票结果
+            seg_pred = pred_sum / args.num_votes
+            pred_choice = seg_pred.contiguous().cpu().data.max(1)[1].numpy()  # [B, N]
+            target_np = target.cpu().numpy()  # [B, N]
+            points_np = points.cpu().numpy()  # [B, N, 3]
 
-                    # 准备批次数据
-                    batch_data = np.array(scene_blocks[start_idx:end_idx])
-                    batch_indices = np.array(scene_block_indices[start_idx:end_idx])
-                    batch_smpw = np.array(scene_block_smpw[start_idx:end_idx])
-
-                    # 转换为tensor并移动到设备
-                    torch_data = torch.FloatTensor(batch_data)
-                    if args.cuda:
-                        torch_data = torch_data.cuda()
-                    torch_data = torch_data.transpose(2, 1)  # [B, C, N]，与训练代码输入格式一致
-
-                    # 模型推理（与训练代码输出格式匹配）
-                    seg_pred, _ = model(torch_data)
-                    batch_pred_label = seg_pred.contiguous().cpu().data.max(1)[1].numpy()  # 在类别维度取最大值
-
-                    # 累积投票
-                    vote_label_pool = add_vote(
-                        vote_label_pool,
-                        batch_indices,
-                        batch_pred_label,
-                        batch_smpw
-                    )
-
-            # 确定最终预测标签
-            pred_label = np.argmax(vote_label_pool, 1)
+            # 收集结果
+            all_preds.append(pred_choice)
+            all_targets.append(target_np)
+            all_points.append(points_np)
 
             # 计算每类指标
             for l in range(NUM_CLASSES):
-                total_seen = np.sum(whole_scene_label == l)
-                total_correct = np.sum((pred_label == l) & (whole_scene_label == l))
-                total_iou_deno = np.sum((pred_label == l) | (whole_scene_label == l))
+                total_seen = np.sum(target_np == l)
+                total_correct = np.sum((pred_choice == l) & (target_np == l))
+                total_iou_deno = np.sum((pred_choice == l) | (target_np == l))
 
                 total_seen_class[l] += total_seen
                 total_correct_class[l] += total_correct
                 total_iou_deno_class[l] += total_iou_deno
 
-            # 计算当前场景的mIOU
-            iou_map = np.array([
-                total_correct_class[l] / (total_iou_deno_class[l] + 1e-6)
-                for l in range(NUM_CLASSES)
-            ])
-            valid_classes = [l for l in range(NUM_CLASSES) if total_seen_class[l] > 0]
-            scene_miou = np.mean(iou_map[valid_classes]) if valid_classes else 0.0
-            log_string(f"场景 {scene_name} 平均IOU: {scene_miou:.4f}")
-
-            # 可视化保存
-            if args.visual:
-                with open(os.path.join(visual_dir, f"{scene_name}_pred.obj"), 'w') as fout, \
-                     open(os.path.join(visual_dir, f"{scene_name}_gt.obj"), 'w') as fout_gt:
-                    for i in range(whole_scene_data.shape[0]):
-                        pred_color = g_label2color(pred_label[i])
-                        gt_color = g_label2color(whole_scene_label[i])
-                        fout.write(f"v {whole_scene_data[i,0]} {whole_scene_data[i,1]} {whole_scene_data[i,2]} {pred_color[0]} {pred_color[1]} {pred_color[2]}\n")
-                        fout_gt.write(f"v {whole_scene_data[i,0]} {whole_scene_data[i,1]} {whole_scene_data[i,2]} {gt_color[0]} {gt_color[1]} {gt_color[2]}\n")
-                with open(os.path.join(visual_dir, f"{scene_name}_pred.txt"), 'w') as f:
-                    for label in pred_label:
-                        f.write(f"{label}\n")
+        # 合并所有结果
+        all_preds = np.concatenate(all_preds, axis=0)
+        all_targets = np.concatenate(all_targets, axis=0)
+        all_points = np.concatenate(all_points, axis=0)
 
         # 计算整体评估指标
         IoU = np.array([
@@ -239,6 +201,17 @@ def main(args):
         log_string(f"\n平均IOU: {mean_iou:.4f}")
         log_string(f"整体准确率: {overall_acc:.4f}")
         log_string(f"平均类别准确率: {np.mean(acc_per_class[acc_per_class > 0]):.4f}")
+
+        # 可视化保存
+        if args.visual:
+            # 保存第一个批次的可视化结果
+            with open(os.path.join(visual_dir, f"test_pred.obj"), 'w') as fout, \
+                 open(os.path.join(visual_dir, f"test_gt.obj"), 'w') as fout_gt:
+                for i in range(min(10000, all_points.shape[0])):  # 限制最大点数
+                    pred_color = g_label2color(all_preds[i])
+                    gt_color = g_label2color(all_targets[i])
+                    fout.write(f"v {all_points[i,0]} {all_points[i,1]} {all_points[i,2]} {pred_color[0]} {pred_color[1]} {pred_color[2]}\n")
+                    fout_gt.write(f"v {all_points[i,0]} {all_points[i,1]} {all_points[i,2]} {gt_color[0]} {gt_color[1]} {gt_color[2]}\n")
 
     log_string("测试完成！")
 
