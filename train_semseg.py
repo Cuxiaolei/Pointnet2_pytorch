@@ -1,9 +1,5 @@
-import argparse
-import os
-import torch
 import torch.nn.parallel
 import torch.utils.data
-from torch.utils.tensorboard import SummaryWriter
 import datetime
 from pathlib import Path
 # 在文件开头添加NumPy导入
@@ -106,9 +102,6 @@ def main():
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     logger = setup_logger(os.path.join(log_dir, 'train.log'))
     logger.info(f"参数: {args}")
-
-    # 初始化TensorBoard
-    writer = SummaryWriter(log_dir=log_dir)
 
     # 数据集配置
     NUM_CLASSES = 3  # 3分类任务
@@ -326,7 +319,6 @@ def main():
             logger.info(f"保存模型到 {save_path}")
 
     logger.info(f"训练完成，最佳验证mIOU: {best_val_miou:.4f}")
-    writer.close()
 
 if __name__ == "__main__":
     main()
