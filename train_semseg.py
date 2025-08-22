@@ -22,8 +22,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
 sys.path.append(os.path.join(ROOT_DIR, 'models'))
 
-classes = ['ceiling', 'floor', 'wall', 'beam', 'column', 'window', 'door', 'table', 'chair', 'sofa', 'bookcase',
-           'board', 'clutter']
+classes = ['0', '1', '2']
 class2label = {cls: i for i, cls in enumerate(classes)}
 seg_classes = class2label
 seg_label_to_cat = {}
@@ -89,7 +88,7 @@ def main(args):
     log_string('PARAMETER ...')
     log_string(args)
 
-    root = '/root/autodl-tmp/data/'
+    root = '/root/autodl-tmp/data/data_s3dis_pointNeXt'
     NUM_CLASSES = 3
     NUM_POINT = args.npoint
     BATCH_SIZE = args.batch_size
