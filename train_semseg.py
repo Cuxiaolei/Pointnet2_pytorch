@@ -1,312 +1,333 @@
-"""
-Author: Benny
-Date: Nov 2019
-"""
 import argparse
 import os
-from data_utils.S3DISDataLoader import S3DISDataset
-from data_utils.CustomSemSegDataset import CustomSemSegDataset
 import torch
+import torch.nn.parallel
+import torch.utils.data
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
+import sys
+from tqdm import tqdm
 import datetime
 import logging
 from pathlib import Path
-import sys
-import importlib
-import shutil
-from tqdm import tqdm
-import provider
-import numpy as np
-import time
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = BASE_DIR
-sys.path.append(os.path.join(ROOT_DIR, 'models'))
+# 导入模型和数据集
+from models import pointnet2_sem_seg
+from data_utils.CustomSemSegDataset import CustomSemSegDataset  # 使用自定义数据集
 
-classes = ['0', '1', '2']
-class2label = {cls: i for i, cls in enumerate(classes)}
-seg_classes = class2label
-seg_label_to_cat = {}
-for i, cat in enumerate(seg_classes.keys()):
-    seg_label_to_cat[i] = cat
-
-def inplace_relu(m):
-    classname = m.__class__.__name__
-    if classname.find('ReLU') != -1:
-        m.inplace=True
-
-def parse_args():
-    parser = argparse.ArgumentParser('Model')
-    parser.add_argument('--model', type=str, default='pointnet_sem_seg', help='model name [default: pointnet_sem_seg]')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch Size during training [default: 8]')
-    parser.add_argument('--epoch', default=100, type=int, help='Epoch to run [default: 100]')
-    parser.add_argument('--learning_rate', default=0.001, type=float, help='Initial learning rate [default: 0.001]')
-    parser.add_argument('--gpu', type=str, default='0', help='GPU to use [default: GPU 0]')
-    parser.add_argument('--optimizer', type=str, default='Adam', help='Adam or SGD [default: Adam]')
-    parser.add_argument('--log_dir', type=str, default=None, help='Log path [default: None]')
-    parser.add_argument('--decay_rate', type=float, default=1e-4, help='weight decay [default: 1e-4]')
-    parser.add_argument('--npoint', type=int, default=10000, help='Point Number [default: 4096]')
-    parser.add_argument('--step_size', type=int, default=10, help='Decay step for lr decay [default: every 10 epochs]')
-    parser.add_argument('--lr_decay', type=float, default=0.7, help='Decay rate for lr decay [default: 0.7]')
-    parser.add_argument('--test_area', type=int, default=5, help='Which area to use for test, option: 1-6 [default: 5]')
-
-    return parser.parse_args()
-
-
-def main(args):
-    def log_string(str):
-        logger.info(str)
-        print(str)
-
-    '''HYPER PARAMETER'''
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
-
-    '''CREATE DIR'''
-    timestr = str(datetime.datetime.now().strftime('%Y-%m-%d_%H-%M'))
-    experiment_dir = Path('./log/')
-    experiment_dir.mkdir(exist_ok=True)
-    experiment_dir = experiment_dir.joinpath('sem_seg')
-    experiment_dir.mkdir(exist_ok=True)
-    if args.log_dir is None:
-        experiment_dir = experiment_dir.joinpath(timestr)
-    else:
-        experiment_dir = experiment_dir.joinpath(args.log_dir)
-    experiment_dir.mkdir(exist_ok=True)
-    checkpoints_dir = experiment_dir.joinpath('checkpoints/')
-    checkpoints_dir.mkdir(exist_ok=True)
-    log_dir = experiment_dir.joinpath('logs/')
-    log_dir.mkdir(exist_ok=True)
-
-    '''LOG'''
-    args = parse_args()
-    logger = logging.getLogger("Model")
+# 设置日志
+def setup_logger(log_file_path):
+    logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler = logging.FileHandler('%s/%s.txt' % (log_dir, args.model))
-    file_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+    # 控制台输出
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # 文件输出
+    file_handler = logging.FileHandler(log_file_path)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-    log_string('PARAMETER ...')
-    log_string(args)
 
-    root = '/root/autodl-tmp/data/data_s3dis_pointNeXt'
-    NUM_CLASSES = 3
-    NUM_POINT = args.npoint
-    BATCH_SIZE = args.batch_size
+    return logger
 
-    print("start loading training data ...")
+# 计算IOU的函数
+def calculate_iou(pred, target, num_classes):
+    """
+    计算每个类别的IOU和平均IOU
+    pred: 预测结果 [B, N]
+    target: 目标标签 [B, N]
+    num_classes: 类别数量
+    """
+    # 展平数据
+    pred = pred.flatten()
+    target = target.flatten()
+
+    # 计算每个类别的TP, FP, FN
+    ious = []
+    for cls in range(num_classes):
+        # 真正例：预测为cls且实际为cls
+        tp = ((pred == cls) & (target == cls)).sum().item()
+        # 假正例：预测为cls但实际不是cls
+        fp = ((pred == cls) & (target != cls)).sum().item()
+        # 假负例：实际为cls但预测不是cls
+        fn = ((pred != cls) & (target == cls)).sum().item()
+
+        # 计算IOU，避免除以零
+        if tp + fp + fn == 0:
+            iou = 0.0
+        else:
+            iou = tp / (tp + fp + fn)
+        ious.append(iou)
+
+    # 计算平均IOU
+    miou = sum(ious) / num_classes if num_classes > 0 else 0.0
+
+    return ious, miou
+
+def main():
+    # 设置默认参数，无需命令行指定
+    parser = argparse.ArgumentParser(description='PointNet++ Semantic Segmentation')
+    parser.add_argument('--model', type=str, default='pointnet2_sem_seg', help='模型名称')
+    parser.add_argument('--log_dir', type=str, default='custom_sem_seg_logs', help='日志和模型保存目录')
+    parser.add_argument('--batch_size', type=int, default=4, help='批次大小')
+    parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
+    parser.add_argument('--npoint', type=int, default=8192, help='每个样本的点数量')
+    parser.add_argument('--lr', type=float, default=0.001, help='学习率')
+    parser.add_argument('--step_size', type=int, default=20, help='学习率衰减步长')
+    parser.add_argument('--gamma', type=float, default=0.5, help='学习率衰减系数')
+    parser.add_argument('--no_cuda', action='store_true', default=False, help='不使用CUDA')
+    parser.add_argument('--seed', type=int, default=1, help='随机种子')
+    parser.add_argument('--eval', action='store_true', default=False, help='仅评估模式')
+    parser.add_argument('--num_workers', type=int, default=4, help='数据加载线程数')
+    parser.add_argument('--weight_decay', type=float, default=1e-4, help='权重衰减')
+    # 请将此处修改为你的数据集实际路径
+    parser.add_argument('--dataset_root', type=str, default='/root/autodl-tmp/data/data_s3dis_pointNeXt', help='数据集根目录')
+
+    args = parser.parse_args()
+    args.cuda = not args.no_cuda and torch.cuda.is_available()
+
+    # 设置随机种子
+    torch.manual_seed(args.seed)
+    if args.cuda:
+        torch.cuda.manual_seed(args.seed)
+
+    # 创建日志目录
+    timestr = str(datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+    log_dir = os.path.join(args.log_dir, timestr)
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    logger = setup_logger(os.path.join(log_dir, 'train.log'))
+    logger.info(f"参数: {args}")
+
+    # 初始化TensorBoard
+    writer = SummaryWriter(log_dir=log_dir)
+
+    # 数据集配置
+    NUM_CLASSES = 3  # 3分类任务
+    logger.info(f"使用自定义数据集，类别数: {NUM_CLASSES}")
+
+    # 加载数据集
+    logger.info("开始加载训练数据...")
     TRAIN_DATASET = CustomSemSegDataset(
-        root=root,
+        root=args.dataset_root,
         split='train',
         num_point=args.npoint,
-        block_size=1.0,
-        sample_rate=1.0,
+        block_size=1.5,
+        sample_rate=0.8,
         transform=True
     )
 
-    print("start loading test data ...")
-    TEST_DATASET = CustomSemSegDataset(
-        root=root,
-        split='test',
+    logger.info("开始加载验证数据...")
+    VAL_DATASET = CustomSemSegDataset(
+        root=args.dataset_root,
+        split='val',
         num_point=args.npoint,
-        block_size=1.0,
+        block_size=1.5,
         sample_rate=1.0,
         transform=False
     )
-    trainDataLoader = torch.utils.data.DataLoader(TRAIN_DATASET, batch_size=BATCH_SIZE, shuffle=True, num_workers=10,
-                                                  pin_memory=True, drop_last=True,
-                                                  worker_init_fn=lambda x: np.random.seed(x + int(time.time())))
-    testDataLoader = torch.utils.data.DataLoader(TEST_DATASET, batch_size=BATCH_SIZE, shuffle=False, num_workers=10,
-                                                 pin_memory=True, drop_last=True)
 
+    # 数据加载器
+    train_loader = torch.utils.data.DataLoader(
+        TRAIN_DATASET,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True if args.cuda else False,
+        drop_last=True
+    )
 
+    val_loader = torch.utils.data.DataLoader(
+        VAL_DATASET,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True if args.cuda else False
+    )
 
+    logger.info(f"训练集样本数: {len(TRAIN_DATASET)}, 验证集样本数: {len(VAL_DATASET)}")
 
-    weights = torch.Tensor(TRAIN_DATASET.labelweights).cuda()
-
-    log_string("The number of training data is: %d" % len(TRAIN_DATASET))
-    log_string("The number of test data is: %d" % len(TEST_DATASET))
-
-    '''MODEL LOADING'''
-    MODEL = importlib.import_module(args.model)
-    shutil.copy('models/%s.py' % args.model, str(experiment_dir))
-    shutil.copy('models/pointnet2_utils.py', str(experiment_dir))
-
-    classifier = MODEL.get_model(NUM_CLASSES).cuda()
-    criterion = MODEL.get_loss().cuda()
-    classifier.apply(inplace_relu)
-
-    def weights_init(m):
-        classname = m.__class__.__name__
-        if classname.find('Conv2d') != -1:
-            torch.nn.init.xavier_normal_(m.weight.data)
-            torch.nn.init.constant_(m.bias.data, 0.0)
-        elif classname.find('Linear') != -1:
-            torch.nn.init.xavier_normal_(m.weight.data)
-            torch.nn.init.constant_(m.bias.data, 0.0)
-
-    try:
-        checkpoint = torch.load(str(experiment_dir) + '/checkpoints/best_model.pth')
-        start_epoch = checkpoint['epoch']
-        classifier.load_state_dict(checkpoint['model_state_dict'])
-        log_string('Use pretrain model')
-    except:
-        log_string('No existing model, starting training from scratch...')
-        start_epoch = 0
-        classifier = classifier.apply(weights_init)
-
-    if args.optimizer == 'Adam':
-        optimizer = torch.optim.Adam(
-            classifier.parameters(),
-            lr=args.learning_rate,
-            betas=(0.9, 0.999),
-            eps=1e-08,
-            weight_decay=args.decay_rate
-        )
+    # 初始化模型
+    if args.model == 'pointnet2_sem_seg':
+        model = pointnet2_sem_seg.get_model(NUM_CLASSES)
+        criterion = pointnet2_sem_seg.get_loss()
     else:
-        optimizer = torch.optim.SGD(classifier.parameters(), lr=args.learning_rate, momentum=0.9)
+        logger.error(f"未知模型: {args.model}")
+        return
 
-    def bn_momentum_adjust(m, momentum):
-        if isinstance(m, torch.nn.BatchNorm2d) or isinstance(m, torch.nn.BatchNorm1d):
-            m.momentum = momentum
+    # 移动到GPU
+    if args.cuda:
+        model = model.cuda()
+        criterion = criterion.cuda()
 
-    LEARNING_RATE_CLIP = 1e-5
-    MOMENTUM_ORIGINAL = 0.1
-    MOMENTUM_DECCAY = 0.5
-    MOMENTUM_DECCAY_STEP = args.step_size
+    # 优化器
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=args.step_size,
+        gamma=args.gamma
+    )
 
-    global_epoch = 0
-    best_iou = 0
+    # 加载预训练模型（如果需要）
+    start_epoch = 0
+    best_val_miou = 0.0  # 改为用mIOU作为最佳模型指标
 
-    for epoch in range(start_epoch, args.epoch):
-        '''Train on chopped scenes'''
-        log_string('**** Epoch %d (%d/%s) ****' % (global_epoch + 1, epoch + 1, args.epoch))
-        lr = max(args.learning_rate * (args.lr_decay ** (epoch // args.step_size)), LEARNING_RATE_CLIP)
-        log_string('Learning rate:%f' % lr)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        momentum = MOMENTUM_ORIGINAL * (MOMENTUM_DECCAY ** (epoch // MOMENTUM_DECCAY_STEP))
-        if momentum < 0.01:
-            momentum = 0.01
-        print('BN momentum updated to: %f' % momentum)
-        classifier = classifier.apply(lambda x: bn_momentum_adjust(x, momentum))
-        num_batches = len(trainDataLoader)
+    # 训练函数
+    def train(epoch):
+        model.train()
+        total_loss = 0.0
         total_correct = 0
-        total_seen = 0
-        loss_sum = 0
-        classifier = classifier.train()
+        total_points = 0
+        # 用于计算IOU的累积变量
+        all_preds = []
+        all_targets = []
 
-        for i, (points, target) in tqdm(enumerate(trainDataLoader), total=len(trainDataLoader), smoothing=0.9):
+        for i, (points, target) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch} 训练")):
+            if args.cuda:
+                points = points.cuda()
+                target = target.cuda()
+
             optimizer.zero_grad()
+            pred, trans_feat = model(points)
+            pred = pred.transpose(2, 1).contiguous()
+            loss = criterion(pred, target, trans_feat)
 
-            points = points.data.numpy()
-            points[:, :, :3] = provider.rotate_point_cloud_z(points[:, :, :3])
-            points = torch.Tensor(points)
-            points, target = points.float().cuda(), target.long().cuda()
-            points = points.transpose(2, 1)
-
-            seg_pred, trans_feat = classifier(points)
-            seg_pred = seg_pred.contiguous().view(-1, NUM_CLASSES)
-
-            batch_label = target.view(-1, 1)[:, 0].cpu().data.numpy()
-            target = target.view(-1, 1)[:, 0]
-            loss = criterion(seg_pred, target, trans_feat, weights)
             loss.backward()
             optimizer.step()
 
-            pred_choice = seg_pred.cpu().data.max(1)[1].numpy()
-            correct = np.sum(pred_choice == batch_label)
-            total_correct += correct
-            total_seen += (BATCH_SIZE * NUM_POINT)
-            loss_sum += loss
-        log_string('Training mean loss: %f' % (loss_sum / num_batches))
-        log_string('Training accuracy: %f' % (total_correct / float(total_seen)))
+            # 计算准确率
+            pred_choice = pred.data.max(2)[1]
+            correct = pred_choice.eq(target.data).cpu().sum()
+            total_correct += correct.item()
+            total_points += target.size(0) * target.size(1)
+            total_loss += loss.item() * points.size(0)
 
-        if epoch % 5 == 0:
-            logger.info('Save model...')
-            savepath = str(checkpoints_dir) + '/model.pth'
-            log_string('Saving at %s' % savepath)
-            state = {
-                'epoch': epoch,
-                'model_state_dict': classifier.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-            }
-            torch.save(state, savepath)
-            log_string('Saving model....')
+            # 收集预测结果和目标用于计算IOU
+            all_preds.append(pred_choice.cpu().numpy())
+            all_targets.append(target.cpu().numpy())
 
-        '''Evaluate on chopped scenes'''
+            # 每10个批次记录一次
+            if i % 10 == 0:
+                writer.add_scalar('train/batch_loss', loss.item(), epoch * len(train_loader) + i)
+
+        # 计算平均损失和准确率
+        avg_loss = total_loss / len(train_loader.dataset)
+        avg_acc = total_correct / total_points
+
+        # 计算IOU
+        all_preds = np.concatenate(all_preds, axis=0)
+        all_targets = np.concatenate(all_targets, axis=0)
+        class_ious, miou = calculate_iou(all_preds, all_targets, NUM_CLASSES)
+
+        # 日志输出
+        logger.info(f"训练 - 轮次: {epoch}")
+        logger.info(f"  损失: {avg_loss:.4f}, 准确率: {avg_acc:.4f}")
+        logger.info(f"  每个类别的IOU: {[f'{iou:.4f}' for iou in class_ious]}")
+        logger.info(f"  平均IOU: {miou:.4f}")
+
+        # TensorBoard记录
+        writer.add_scalar('train/avg_loss', avg_loss, epoch)
+        writer.add_scalar('train/avg_acc', avg_acc, epoch)
+        writer.add_scalar('train/miou', miou, epoch)
+        for cls in range(NUM_CLASSES):
+            writer.add_scalar(f'train/iou_cls_{cls}', class_ious[cls], epoch)
+
+        return avg_loss, avg_acc, miou
+
+    # 验证函数
+    def validate(epoch):
+        model.eval()
+        total_loss = 0.0
+        total_correct = 0
+        total_points = 0
+        # 用于计算IOU的累积变量
+        all_preds = []
+        all_targets = []
+
         with torch.no_grad():
-            num_batches = len(testDataLoader)
-            total_correct = 0
-            total_seen = 0
-            loss_sum = 0
-            labelweights = np.zeros(NUM_CLASSES)
-            total_seen_class = [0 for _ in range(NUM_CLASSES)]
-            total_correct_class = [0 for _ in range(NUM_CLASSES)]
-            total_iou_deno_class = [0 for _ in range(NUM_CLASSES)]
-            classifier = classifier.eval()
+            for i, (points, target) in enumerate(tqdm(val_loader, desc=f"Epoch {epoch} 验证")):
+                if args.cuda:
+                    points = points.cuda()
+                    target = target.cuda()
 
-            log_string('---- EPOCH %03d EVALUATION ----' % (global_epoch + 1))
-            for i, (points, target) in tqdm(enumerate(testDataLoader), total=len(testDataLoader), smoothing=0.9):
-                points = points.data.numpy()
-                points = torch.Tensor(points)
-                points, target = points.float().cuda(), target.long().cuda()
-                points = points.transpose(2, 1)
+                pred, trans_feat = model(points)
+                pred = pred.transpose(2, 1).contiguous()
+                loss = criterion(pred, target, trans_feat)
 
-                seg_pred, trans_feat = classifier(points)
-                pred_val = seg_pred.contiguous().cpu().data.numpy()
-                seg_pred = seg_pred.contiguous().view(-1, NUM_CLASSES)
+                # 计算准确率
+                pred_choice = pred.data.max(2)[1]
+                correct = pred_choice.eq(target.data).cpu().sum()
+                total_correct += correct.item()
+                total_points += target.size(0) * target.size(1)
+                total_loss += loss.item() * points.size(0)
 
-                batch_label = target.cpu().data.numpy()
-                target = target.view(-1, 1)[:, 0]
-                loss = criterion(seg_pred, target, trans_feat, weights)
-                loss_sum += loss
-                pred_val = np.argmax(pred_val, 2)
-                correct = np.sum((pred_val == batch_label))
-                total_correct += correct
-                total_seen += (BATCH_SIZE * NUM_POINT)
-                tmp, _ = np.histogram(batch_label, range(NUM_CLASSES + 1))
-                labelweights += tmp
+                # 收集预测结果和目标用于计算IOU
+                all_preds.append(pred_choice.cpu().numpy())
+                all_targets.append(target.cpu().numpy())
 
-                for l in range(NUM_CLASSES):
-                    total_seen_class[l] += np.sum((batch_label == l))
-                    total_correct_class[l] += np.sum((pred_val == l) & (batch_label == l))
-                    total_iou_deno_class[l] += np.sum(((pred_val == l) | (batch_label == l)))
+        # 计算平均损失和准确率
+        avg_loss = total_loss / len(val_loader.dataset)
+        avg_acc = total_correct / total_points
 
-            labelweights = labelweights.astype(np.float32) / np.sum(labelweights.astype(np.float32))
-            mIoU = np.mean(np.array(total_correct_class) / (np.array(total_iou_deno_class, dtype=np.float) + 1e-6))
-            log_string('eval mean loss: %f' % (loss_sum / float(num_batches)))
-            log_string('eval point avg class IoU: %f' % (mIoU))
-            log_string('eval point accuracy: %f' % (total_correct / float(total_seen)))
-            log_string('eval point avg class acc: %f' % (
-                np.mean(np.array(total_correct_class) / (np.array(total_seen_class, dtype=np.float) + 1e-6))))
+        # 计算IOU
+        all_preds = np.concatenate(all_preds, axis=0)
+        all_targets = np.concatenate(all_targets, axis=0)
+        class_ious, miou = calculate_iou(all_preds, all_targets, NUM_CLASSES)
 
-            iou_per_class_str = '------- IoU --------\n'
-            for l in range(NUM_CLASSES):
-                iou_per_class_str += 'class %s weight: %.3f, IoU: %.3f \n' % (
-                    seg_label_to_cat[l] + ' ' * (14 - len(seg_label_to_cat[l])), labelweights[l - 1],
-                    total_correct_class[l] / float(total_iou_deno_class[l]))
+        # 日志输出
+        logger.info(f"验证 - 轮次: {epoch}")
+        logger.info(f"  损失: {avg_loss:.4f}, 准确率: {avg_acc:.4f}")
+        logger.info(f"  每个类别的IOU: {[f'{iou:.4f}' for iou in class_ious]}")
+        logger.info(f"  平均IOU: {miou:.4f}")
 
-            log_string(iou_per_class_str)
-            log_string('Eval mean loss: %f' % (loss_sum / num_batches))
-            log_string('Eval accuracy: %f' % (total_correct / float(total_seen)))
+        # TensorBoard记录
+        writer.add_scalar('val/avg_loss', avg_loss, epoch)
+        writer.add_scalar('val/avg_acc', avg_acc, epoch)
+        writer.add_scalar('val/miou', miou, epoch)
+        for cls in range(NUM_CLASSES):
+            writer.add_scalar(f'val/iou_cls_{cls}', class_ious[cls], epoch)
 
-            if mIoU >= best_iou:
-                best_iou = mIoU
-                logger.info('Save model...')
-                savepath = str(checkpoints_dir) + '/best_model.pth'
-                log_string('Saving at %s' % savepath)
-                state = {
-                    'epoch': epoch,
-                    'class_avg_iou': mIoU,
-                    'model_state_dict': classifier.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                }
-                torch.save(state, savepath)
-                log_string('Saving model....')
-            log_string('Best mIoU: %f' % best_iou)
-        global_epoch += 1
+        return avg_loss, avg_acc, miou
 
+    # 仅评估模式
+    if args.eval:
+        logger.info("进入仅评估模式")
+        val_loss, val_acc, val_miou = validate(start_epoch)
+        return
 
-if __name__ == '__main__':
-    args = parse_args()
-    main(args)
+    # 开始训练
+    logger.info("开始训练...")
+    for epoch in range(start_epoch, args.epochs):
+        # 训练
+        train_loss, train_acc, train_miou = train(epoch)
+
+        # 验证
+        val_loss, val_acc, val_miou = validate(epoch)
+
+        # 学习率调度
+        scheduler.step()
+
+        # 保存最佳模型（使用mIOU作为指标）
+        if val_miou > best_val_miou:
+            best_val_miou = val_miou
+            save_path = os.path.join(log_dir, f"best_model_epoch_{epoch}.pth")
+            torch.save(model.state_dict(), save_path)
+            logger.info(f"保存最佳模型到 {save_path}, 验证mIOU: {best_val_miou:.4f}")
+
+        # 每10轮保存一次模型
+        if epoch % 10 == 0:
+            save_path = os.path.join(log_dir, f"model_epoch_{epoch}.pth")
+            torch.save(model.state_dict(), save_path)
+            logger.info(f"保存模型到 {save_path}")
+
+    logger.info(f"训练完成，最佳验证mIOU: {best_val_miou:.4f}")
+    writer.close()
+
+if __name__ == "__main__":
+    main()
