@@ -75,16 +75,17 @@ class CustomSemSegDataset(Dataset):
             if not os.path.exists(full_path):
                 raise FileNotFoundError(f"场景文件不存在: {full_path}")
 
-            # 只加载少量数据获取点数量（避免内存占用过大）
-            # 使用mmap_mode避免加载完整数据
-            with np.load(full_path, mmap_mode='r') as data:
-                self.scene_point_counts.append(data.shape[0])
+            # 修复：不使用with语句加载mmap文件
+            data = np.load(full_path, mmap_mode='r')
+            self.scene_point_counts.append(data.shape[0])
             self.scene_paths.append(full_path)
+            # 关闭文件句柄
+            del data
 
         # 计算每个场景的采样权重（基于点数量）
         self.scene_weights = np.array(self.scene_point_counts) / np.sum(self.scene_point_counts)
 
-        # 预计算标签权重（首次运行时计算，之后可缓存）
+        # 预计算标签权重
         self._compute_label_weights()
 
     def _compute_label_weights(self):
@@ -96,17 +97,20 @@ class CustomSemSegDataset(Dataset):
             self.label_weights = np.load(cache_file)
             return
 
-        # 否则计算标签权重（随机采样部分点计算，避免加载全部数据）
+        # 否则计算标签权重（随机采样部分点计算）
         all_labels = []
         sample_ratio = 0.1  # 采样10%的点计算权重
 
         for path in self.scene_paths:
-            with np.load(path, mmap_mode='r') as data:
-                num_points = data.shape[0]
-                sample_size = max(1000, int(num_points * sample_ratio))  # 至少采样1000点
-                indices = np.random.choice(num_points, sample_size, replace=False)
-                labels = data[indices, 9].astype(np.int32)
-                all_labels.append(labels)
+            # 修复：不使用with语句加载mmap文件
+            data = np.load(path, mmap_mode='r')
+            num_points = data.shape[0]
+            sample_size = max(1000, int(num_points * sample_ratio))  # 至少采样1000点
+            indices = np.random.choice(num_points, sample_size, replace=False)
+            labels = data[indices, 9].astype(np.int32)
+            all_labels.append(labels)
+            # 关闭文件句柄
+            del data
 
         all_labels = np.concatenate(all_labels, axis=0)
         self.label_weights = np.bincount(all_labels, minlength=3)  # 3分类
@@ -120,21 +124,26 @@ class CustomSemSegDataset(Dataset):
         return len(self.scene_paths)
 
     def __getitem__(self, idx):
-        # 加载单个场景数据（使用mmap_mode减少内存占用）
+        # 加载单个场景数据（修复mmap加载问题）
         scene_path = self.scene_paths[idx]
-        with np.load(scene_path, mmap_mode='r') as data:
-            # 随机采样点（针对20W点的大场景）
-            num_points = data.shape[0]
+        # 不使用with语句，直接加载
+        data = np.load(scene_path, mmap_mode='r')
 
-            # 如果点数量远大于需要的数量，先进行一次粗采样
-            if num_points > self.num_point * 5:
-                sample_size = int(self.num_point * 2)  # 先采样到目标的2倍
-                indices = np.random.choice(num_points, sample_size, replace=False)
-                points = data[indices, :9].copy()  # 前9通道: 坐标+颜色+法向量
-                labels = data[indices, 9].astype(np.int32).copy()
-            else:
-                points = data[:, :9].copy()
-                labels = data[:, 9].astype(np.int32).copy()
+        # 随机采样点（针对20W点的大场景）
+        num_points = data.shape[0]
+
+        # 如果点数量远大于需要的数量，先进行一次粗采样
+        if num_points > self.num_point * 5:
+            sample_size = int(self.num_point * 2)  # 先采样到目标的2倍
+            indices = np.random.choice(num_points, sample_size, replace=False)
+            points = data[indices, :9].copy()  # 前9通道: 坐标+颜色+法向量
+            labels = data[indices, 9].astype(np.int32).copy()
+        else:
+            points = data[:, :9].copy()
+            labels = data[:, 9].astype(np.int32).copy()
+
+        # 关闭文件句柄
+        del data
 
         # 点云归一化（仅对坐标）
         points[:, :3] = pc_normalize(points[:, :3])
