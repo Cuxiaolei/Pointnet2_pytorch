@@ -183,7 +183,6 @@ def main():
     start_epoch = 0
     best_val_miou = 0.0  # 改为用mIOU作为最佳模型指标
 
-    # 训练函数
     def train(epoch):
         model.train()
         total_loss = 0.0
@@ -200,15 +199,19 @@ def main():
 
             optimizer.zero_grad()
             pred, trans_feat = model(points)  # pred形状: [B, C, N] 其中C是类别数
-            # 语义分割需要将预测结果转换为 [B, N, C] 才能与 [B, N] 的target计算交叉熵
-            pred = pred.transpose(1, 2).contiguous()  # 调整为 [B, N, C]
+
+            # 关键修复：调整预测结果维度以适应交叉熵损失
+            # F.cross_entropy期望输入形状为 [B*N, C] 或 [B, C, N]
+            # 目标标签形状为 [B*N] 或 [B, N]
+            # 保持pred为[B, C, N]形状，无需转置为[B, N, C]
+
             loss = criterion(pred, target, trans_feat)
 
             loss.backward()
             optimizer.step()
 
             # 计算准确率
-            pred_choice = pred.data.max(2)[1]  # [B, N]
+            pred_choice = pred.data.max(1)[1]  # 对于[B, C, N]，在通道维度1上取最大值
             correct = pred_choice.eq(target.data).cpu().sum()
             total_correct += correct.item()
             total_points += target.size(0) * target.size(1)
@@ -246,7 +249,7 @@ def main():
 
         return avg_loss, avg_acc, miou
 
-    # 验证函数
+    # 同时修改验证函数
     def validate(epoch):
         model.eval()
         total_loss = 0.0
@@ -262,18 +265,19 @@ def main():
                     points = points.cuda()
                     target = target.cuda()
 
-                pred, trans_feat = model(points)
-                pred = pred.transpose(2, 1).contiguous()
+                pred, trans_feat = model(points)  # [B, C, N]
+
+                # 保持pred为[B, C, N]形状，不转置
                 loss = criterion(pred, target, trans_feat)
 
-                # 计算准确率
-                pred_choice = pred.data.max(2)[1]
+                # 计算准确率 - 在通道维度1上取最大值
+                pred_choice = pred.data.max(1)[1]
                 correct = pred_choice.eq(target.data).cpu().sum()
                 total_correct += correct.item()
                 total_points += target.size(0) * target.size(1)
                 total_loss += loss.item() * points.size(0)
 
-                # 收集预测结果和目标用于计算IOU
+                # 收集预测结果和目标
                 all_preds.append(pred_choice.cpu().numpy())
                 all_targets.append(target.cpu().numpy())
 
