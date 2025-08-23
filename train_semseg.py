@@ -2,7 +2,6 @@ import torch.nn.parallel
 import torch.utils.data
 import datetime
 from pathlib import Path
-# 在文件开头添加NumPy导入
 import numpy as np
 import torch
 import os
@@ -10,6 +9,7 @@ import argparse
 import logging
 from tqdm import tqdm
 import sys
+import csv  # 导入csv模块用于保存结果
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -35,10 +35,10 @@ def setup_logger(log_file_path):
 
     return logger
 
-# 计算IOU的函数
-def calculate_iou(pred, target, num_classes):
+# 计算准确率和IOU的函数
+def calculate_metrics(pred, target, num_classes):
     """
-    计算每个类别的IOU和平均IOU
+    计算每个类别的准确率、IOU和总体准确率
     pred: 预测结果 [B, N]
     target: 目标标签 [B, N]
     num_classes: 类别数量
@@ -47,7 +47,11 @@ def calculate_iou(pred, target, num_classes):
     pred = pred.flatten()
     target = target.flatten()
 
-    # 计算每个类别的TP, FP, FN
+    # 计算总体准确率
+    oa = (pred == target).sum().item() / len(pred) if len(pred) > 0 else 0.0
+
+    # 计算每个类别的TP, FP, FN和准确率
+    class_accs = []
     ious = []
     for cls in range(num_classes):
         # 真正例：预测为cls且实际为cls
@@ -56,6 +60,15 @@ def calculate_iou(pred, target, num_classes):
         fp = ((pred == cls) & (target != cls)).sum().item()
         # 假负例：实际为cls但预测不是cls
         fn = ((pred != cls) & (target == cls)).sum().item()
+        # 总实际为cls的样本数
+        total = (target == cls).sum().item()
+
+        # 计算类别准确率
+        if total == 0:
+            acc = 0.0
+        else:
+            acc = tp / total
+        class_accs.append(acc)
 
         # 计算IOU，避免除以零
         if tp + fp + fn == 0:
@@ -64,13 +77,14 @@ def calculate_iou(pred, target, num_classes):
             iou = tp / (tp + fp + fn)
         ious.append(iou)
 
-    # 计算平均IOU
+    # 计算平均IOU和平均准确率
     miou = sum(ious) / num_classes if num_classes > 0 else 0.0
+    macc = sum(class_accs) / num_classes if num_classes > 0 else 0.0
 
-    return ious, miou
+    return oa, class_accs, macc, ious, miou
 
 def main():
-    # 设置默认参数，无需命令行指定
+    # 设置默认参数
     parser = argparse.ArgumentParser(description='PointNet++ Semantic Segmentation')
     parser.add_argument('--model', type=str, default='pointnet2_sem_seg', help='模型名称')
     parser.add_argument('--log_dir', type=str, default='custom_sem_seg_logs', help='日志和模型保存目录')
@@ -85,7 +99,6 @@ def main():
     parser.add_argument('--eval', action='store_true', default=False, help='仅评估模式')
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载线程数')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='权重衰减')
-    # 请将此处修改为你的数据集实际路径
     parser.add_argument('--dataset_root', type=str, default='/root/autodl-tmp/data/data_s3dis_pointNeXt', help='数据集根目录')
 
     args = parser.parse_args()
@@ -106,6 +119,18 @@ def main():
     # 数据集配置
     NUM_CLASSES = 3  # 3分类任务
     logger.info(f"使用自定义数据集，类别数: {NUM_CLASSES}")
+
+    # 创建CSV文件并写入表头
+    metrics_file = os.path.join(log_dir, 'metrics.csv')
+    with open(metrics_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        # 表头
+        header = ['epoch', 'phase', 'oa', 'macc', 'miou']
+        for i in range(NUM_CLASSES):
+            header.append(f'class_{i}_acc')
+        for i in range(NUM_CLASSES):
+            header.append(f'class_{i}_iou')
+        writer.writerow(header)
 
     # 加载数据集
     logger.info("开始加载训练数据...")
@@ -148,7 +173,7 @@ def main():
 
     logger.info(f"训练集样本数: {len(TRAIN_DATASET)}, 验证集样本数: {len(VAL_DATASET)}")
 
-    # 加载数据集后，添加验证集类别分布统计
+    # 统计验证集类别分布
     logger.info("统计验证集类别分布...")
     val_label_counts = np.zeros(NUM_CLASSES, dtype=int)
     for points, labels in val_loader:
@@ -159,10 +184,8 @@ def main():
     logger.info(f"验证集总类别分布: {dict(zip(range(NUM_CLASSES), val_label_counts))}")
 
     # 初始化模型
-    # 在模型初始化部分修改损失函数的创建方式
     if args.model == 'pointnet2_sem_seg':
         model = pointnet2_sem_seg.get_model(NUM_CLASSES)
-        # 使用带权重的损失函数，传入计算好的类别权重
         criterion = pointnet2_sem_seg.get_loss_function(
             weight=torch.FloatTensor(TRAIN_DATASET.label_weights).cuda() if args.cuda else torch.FloatTensor(
                 TRAIN_DATASET.label_weights)
@@ -190,77 +213,72 @@ def main():
 
     # 加载预训练模型（如果需要）
     start_epoch = 0
-    best_val_miou = 0.0  # 改为用mIOU作为最佳模型指标
+    best_val_miou = 0.0  # 用mIOU作为最佳模型指标
+    best_model_path = os.path.join(log_dir, "best_model.pth")  # 固定最佳模型路径
 
     def train(epoch):
         model.train()
         total_loss = 0.0
-        total_correct = 0
-        total_points = 0
-        # 用于计算IOU的累积变量
+        # 用于计算指标的累积变量
         all_preds = []
         all_targets = []
 
         for i, (points, target) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch} 训练")):
             if args.cuda:
                 points = points.cuda()
-                target = target.cuda()  # target形状: [B, N] 其中N是点数量
+                target = target.cuda()
 
             optimizer.zero_grad()
-            pred, trans_feat = model(points)  # pred形状: [B, C, N] 其中C是类别数
-
-            # 关键修复：调整预测结果维度以适应交叉熵损失
-            # F.cross_entropy期望输入形状为 [B*N, C] 或 [B, C, N]
-            # 目标标签形状为 [B*N] 或 [B, N]
-            # 保持pred为[B, C, N]形状，无需转置为[B, N, C]
+            pred, trans_feat = model(points)
 
             loss = criterion(pred, target, trans_feat)
-
             loss.backward()
             optimizer.step()
 
-            # 计算准确率
-            pred_choice = pred.data.max(1)[1]  # 对于[B, C, N]，在通道维度1上取最大值
-            correct = pred_choice.eq(target.data).cpu().sum()
-            total_correct += correct.item()
-            total_points += target.size(0) * target.size(1)
+            # 计算预测结果
+            pred_choice = pred.data.max(1)[1]
             total_loss += loss.item() * points.size(0)
 
-            # 收集预测结果和目标用于计算IOU
+            # 收集预测结果和目标用于计算指标
             all_preds.append(pred_choice.cpu().numpy())
             all_targets.append(target.cpu().numpy())
 
-            if i % 10 == 0:  # 每10个batch打印一次
+            if i % 10 == 0:
                 target_np = target.cpu().numpy().flatten()
                 unique, counts = np.unique(target_np, return_counts=True)
                 batch_dist = dict(zip(unique, counts))
                 logger.info(f"训练Batch {i} 类别分布: {batch_dist}")
 
-
-        # 计算平均损失和准确率
+        # 计算平均损失
         avg_loss = total_loss / len(train_loader.dataset)
-        avg_acc = total_correct / total_points
 
-        # 计算IOU
+        # 计算各项指标
         all_preds = np.concatenate(all_preds, axis=0)
         all_targets = np.concatenate(all_targets, axis=0)
-        class_ious, miou = calculate_iou(all_preds, all_targets, NUM_CLASSES)
+        oa, class_accs, macc, class_ious, miou = calculate_metrics(all_preds, all_targets, NUM_CLASSES)
 
         # 日志输出
         logger.info(f"训练 - 轮次: {epoch}")
-        logger.info(f"  损失: {avg_loss:.4f}, 准确率: {avg_acc:.4f}")
+        logger.info(f"  损失: {avg_loss:.4f}, 总体准确率: {oa:.4f}")
+        logger.info(f"  每个类别的准确率: {[f'{acc:.4f}' for acc in class_accs]}")
+        logger.info(f"  平均准确率: {macc:.4f}")
         logger.info(f"  每个类别的IOU: {[f'{iou:.4f}' for iou in class_ious]}")
         logger.info(f"  平均IOU: {miou:.4f}")
 
-        return avg_loss, avg_acc, miou
+        # 保存到CSV
+        with open(metrics_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            row = [epoch, 'train', oa, macc, miou]
+            row.extend(class_accs)
+            row.extend(class_ious)
+            writer.writerow(row)
 
-    # 同时修改验证函数
+        return avg_loss, oa, macc, miou
+
     def validate(epoch):
         model.eval()
         total_loss = 0.0
-        total_correct = 0
-        total_points = 0
-        # 用于计算IOU的累积变量
+        # 用于计算指标的累积变量
         all_preds = []
         all_targets = []
 
@@ -270,60 +288,63 @@ def main():
                     points = points.cuda()
                     target = target.cuda()
 
-                pred, trans_feat = model(points)  # [B, C, N]
-
-                # 保持pred为[B, C, N]形状，不转置
+                pred, trans_feat = model(points)
                 loss = criterion(pred, target, trans_feat)
 
-                # 计算准确率 - 在通道维度1上取最大值
+                # 计算预测结果
                 pred_choice = pred.data.max(1)[1]
-                correct = pred_choice.eq(target.data).cpu().sum()
-                total_correct += correct.item()
-                total_points += target.size(0) * target.size(1)
                 total_loss += loss.item() * points.size(0)
 
                 # 收集预测结果和目标
                 all_preds.append(pred_choice.cpu().numpy())
                 all_targets.append(target.cpu().numpy())
 
-        # 计算平均损失和准确率
-        avg_loss = total_loss / len(val_loader.dataset)
-        avg_acc = total_correct / total_points
+                if i % 10 == 0:
+                    target_np = target.cpu().numpy().flatten()
+                    unique, counts = np.unique(target_np, return_counts=True)
+                    batch_dist = dict(zip(unique, counts))
+                    logger.info(f"验证Batch {i} 类别分布: {batch_dist}")
 
-        # 计算IOU
+        # 计算平均损失
+        avg_loss = total_loss / len(val_loader.dataset)
+
+        # 计算各项指标
         all_preds = np.concatenate(all_preds, axis=0)
         all_targets = np.concatenate(all_targets, axis=0)
-        class_ious, miou = calculate_iou(all_preds, all_targets, NUM_CLASSES)
+        oa, class_accs, macc, class_ious, miou = calculate_metrics(all_preds, all_targets, NUM_CLASSES)
 
         # 日志输出
         logger.info(f"验证 - 轮次: {epoch}")
-        logger.info(f"  损失: {avg_loss:.4f}, 准确率: {avg_acc:.4f}")
+        logger.info(f"  损失: {avg_loss:.4f}, 总体准确率: {oa:.4f}")
+        logger.info(f"  每个类别的准确率: {[f'{acc:.4f}' for acc in class_accs]}")
+        logger.info(f"  平均准确率: {macc:.4f}")
         logger.info(f"  每个类别的IOU: {[f'{iou:.4f}' for iou in class_ious]}")
         logger.info(f"  平均IOU: {miou:.4f}")
 
-        if i % 10 == 0:
-            target_np = target.cpu().numpy().flatten()
-            unique, counts = np.unique(target_np, return_counts=True)
-            batch_dist = dict(zip(unique, counts))
-            logger.info(f"验证Batch {i} 类别分布: {batch_dist}")
+        # 保存到CSV
+        with open(metrics_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            row = [epoch, 'val', oa, macc, miou]
+            row.extend(class_accs)
+            row.extend(class_ious)
+            writer.writerow(row)
 
-
-        return avg_loss, avg_acc, miou
+        return avg_loss, oa, macc, miou
 
     # 仅评估模式
     if args.eval:
         logger.info("进入仅评估模式")
-        val_loss, val_acc, val_miou = validate(start_epoch)
+        val_loss, val_oa, val_macc, val_miou = validate(start_epoch)
         return
 
     # 开始训练
     logger.info("开始训练...")
     for epoch in range(start_epoch, args.epochs):
         # 训练
-        train_loss, train_acc, train_miou = train(epoch)
+        train_loss, train_oa, train_macc, train_miou = train(epoch)
 
         # 验证
-        val_loss, val_acc, val_miou = validate(epoch)
+        val_loss, val_oa, val_macc, val_miou = validate(epoch)
 
         # 学习率调度
         scheduler.step()
@@ -331,9 +352,9 @@ def main():
         # 保存最佳模型（使用mIOU作为指标）
         if val_miou > best_val_miou:
             best_val_miou = val_miou
-            save_path = os.path.join(log_dir, f"best_model_epoch_{epoch}.pth")
-            torch.save(model.state_dict(), save_path)
-            logger.info(f"保存最佳模型到 {save_path}, 验证mIOU: {best_val_miou:.4f}")
+            # 保存为固定文件名，会覆盖之前的最佳模型
+            torch.save(model.state_dict(), best_model_path)
+            logger.info(f"更新最佳模型到 {best_model_path}, 验证mIOU: {best_val_miou:.4f}")
 
         # 每10轮保存一次模型
         if epoch % 10 == 0:
@@ -341,7 +362,7 @@ def main():
             torch.save(model.state_dict(), save_path)
             logger.info(f"保存模型到 {save_path}")
 
-    logger.info(f"训练完成，最佳验证mIOU: {best_val_miou:.4f}")
+    logger.info(f"训练完成，最佳验证mIOU: {best_val_miou:.4f}，最佳模型路径: {best_model_path}")
 
 if __name__ == "__main__":
     main()
