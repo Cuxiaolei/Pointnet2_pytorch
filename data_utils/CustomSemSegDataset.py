@@ -15,12 +15,11 @@ def pc_normalize(pc):
     return pc
 
 
-def random_point_dropout(pc, label, max_dropout_ratio=0.875):
-    """随机丢弃点云点（数据增强）"""
+def random_point_dropout(pc, label, max_dropout_ratio=0.3):  # 从0.875→0.3
     dropout_ratio = np.random.random() * max_dropout_ratio
     drop_idx = np.where(np.random.random((pc.shape[0])) <= dropout_ratio)[0]
     if len(drop_idx) > 0:
-        pc[drop_idx] = pc[0]  # 用第一个点填充
+        pc[drop_idx] = pc[0]
         label[drop_idx] = label[0]
     return pc, label
 
@@ -89,39 +88,30 @@ class CustomSemSegDataset(Dataset):
         self._compute_label_weights()
 
     def _compute_label_weights(self):
-        """计算标签权重（处理大数据集时优化）"""
         cache_file = os.path.join(self.root, f'{self.split}_label_weights.npy')
-
-        # 如果有缓存文件直接加载
         if os.path.exists(cache_file):
-            self.label_weights = np.load(cache_file)
-            return
+            os.remove(cache_file)  # 删除旧缓存，确保新权重生效
 
-        # 否则计算标签权重（随机采样部分点计算）
+        # 1. 统计所有类别的总点数（采样10%点，兼顾效率）
         all_labels = []
-        sample_ratio = 0.1  # 采样10%的点计算权重
-
         for path in self.scene_paths:
-            # 修复：不使用with语句加载mmap文件
             data = np.load(path, mmap_mode='r')
-            num_points = data.shape[0]
-            sample_size = max(1000, int(num_points * sample_ratio))  # 至少采样1000点
-            indices = np.random.choice(num_points, sample_size, replace=False)
-            labels = data[indices, 9].astype(np.int32)
-            all_labels.append(labels)
-            # 关闭文件句柄
+            sample_size = max(1000, int(data.shape[0] * 0.1))
+            indices = np.random.choice(data.shape[0], sample_size, replace=False)
+            all_labels.append(data[indices, 9].astype(np.int32))
             del data
+        all_labels = np.concatenate(all_labels)
 
-        all_labels = np.concatenate(all_labels, axis=0)
-        self.label_weights = np.bincount(all_labels, minlength=3)  # 3分类
-        self.label_weights = self.label_weights / np.sum(self.label_weights)
-        self.label_weights = 1.0 / (np.log(1.2 + self.label_weights))
+        # 2. 计算激进权重：总点数 / 类别点数（类别越少，权重越大）
+        cls_counts = np.bincount(all_labels, minlength=3)
+        total_counts = cls_counts.sum()
+        self.label_weights = total_counts / (cls_counts + 1e-6)  # 避免除零
+        # 归一化权重（防止权重过大导致训练不稳定）
+        self.label_weights = self.label_weights / self.label_weights.max() * 10  # 最大权重设为10
 
-        self.label_weights = 1.0 / (np.log(1.2 + self.label_weights))
-        # 打印权重
-        print(f"类别权重: {self.label_weights}")  # 索引0、1、2对应三个类别
-        # 保存缓存
         np.save(cache_file, self.label_weights)
+        print(f"类别权重：{self.label_weights}")  # 确保类别2权重最大（如[3.5, 1.8, 5.2]）
+        return self.label_weights
 
 
 
@@ -153,16 +143,12 @@ class CustomSemSegDataset(Dataset):
         # 点云归一化（仅对坐标）
         points[:, :3] = pc_normalize(points[:, :3])
 
-        # 数据增强（仅训练集）
+        # 数据增强部分（train模式下）
         if self.split == 'train' and self.transform:
-            # 随机旋转
-            points = rotate_point_cloud_z(points)
-            # 随机缩放
-            points = random_scale_point_cloud(points)
-            # 随机平移
-            points = random_shift_point_cloud(points)
-            # 随机丢弃点
-            points, labels = random_point_dropout(points, labels)
+            points = rotate_point_cloud_z(points)  # 保留旋转（不改变类别）
+            points = random_scale_point_cloud(points)  # 保留缩放（全局，不破坏局部）
+            points = random_shift_point_cloud(points)  # 保留平移（全局，不破坏局部）
+            points, labels = random_point_dropout(points, labels)  # 用降低后的丢弃比例
 
         # 最终采样到目标点数
         if points.shape[0] > self.num_point:
@@ -190,42 +176,36 @@ class CustomSemSegDataset(Dataset):
         return points, labels
 
     def _stratified_sampling(self, labels, num_samples):
-        """分层采样，保持类别比例"""
         unique_labels = np.unique(labels)
-        samples_per_label = {}
+        num_classes = len(unique_labels)
 
-        # 计算每个类别的样本数量
-        for label in unique_labels:
-            mask = (labels == label)
-            count = np.sum(mask)
-            if count == 0:
-                samples_per_label[label] = 0
-                continue
+        # 1. 每个类别平均分配点数（如8192点→3类各2730/2731点）
+        base_points = num_samples // num_classes
+        remain_points = num_samples % num_classes
+        samples_per_cls = {cls: base_points for cls in unique_labels}
+        # 剩余点数随机分给前N个类，保证总数达标
+        for cls in list(unique_labels)[:remain_points]:
+            samples_per_cls[cls] += 1
 
-            # 按比例分配采样数量
-            ratio = count / len(labels)
-            samples_per_label[label] = max(1, int(ratio * num_samples))  # 每个类别至少1个
-
-        # 调整总数量
-        total = sum(samples_per_label.values())
-        if total != num_samples:
-            diff = num_samples - total
-            # 分配差异
-            for label in unique_labels:
-                if diff == 0:
-                    break
-                samples_per_label[label] += 1
-                diff -= 1
-
-        # 执行采样
         indices = []
-        for label in unique_labels:
-            if samples_per_label[label] == 0:
-                continue
-            mask = (labels == label)
-            label_indices = np.where(mask)[0]
-            # 随机选择
-            selected = np.random.choice(label_indices, samples_per_label[label], replace=False)
+        for cls in unique_labels:
+            # 提取当前类的所有点索引
+            cls_indices = np.where(labels == cls)[0]
+            available = len(cls_indices)
+            need = samples_per_cls[cls]
+
+            if available >= need:
+                # 点数充足：随机采need个
+                selected = np.random.choice(cls_indices, need, replace=False)
+            else:
+                # 点数不足：先取全部，剩余重复采样（保证数量）
+                selected = np.concatenate([
+                    cls_indices,
+                    np.random.choice(cls_indices, need - available, replace=True)
+                ])
             indices.extend(selected)
 
-        return np.array(indices)
+        # 打乱顺序，避免同类点聚集
+        indices = np.array(indices)
+        np.random.shuffle(indices)
+        return indices
