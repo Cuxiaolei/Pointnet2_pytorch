@@ -59,7 +59,7 @@ def parse_args():
     # 与训练代码同步的默认参数
     parser.add_argument('--batch_size', type=int, default=4, help='批次大小')
     parser.add_argument('--gpu', type=str, default='0', help='指定GPU设备')
-    parser.add_argument('--num_point', type=int, default=10000, help='每个样本的点数量')
+    parser.add_argument('--num_point', type=int, default=60000, help='每个样本的点数量')
     parser.add_argument('--log_dir', type=str, default='custom_sem_seg_logs', help='日志和模型根目录')
     parser.add_argument('--visual', action='store_true', default=False, help='是否可视化结果')
     parser.add_argument('--num_votes', type=int, default=3, help='投票聚合次数')
