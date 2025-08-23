@@ -76,7 +76,7 @@ def main():
     parser.add_argument('--log_dir', type=str, default='custom_sem_seg_logs', help='日志和模型保存目录')
     parser.add_argument('--batch_size', type=int, default=4, help='批次大小')
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
-    parser.add_argument('--npoint', type=int, default=8192, help='每个样本的点数量')
+    parser.add_argument('--npoint', type=int, default=60000, help='每个样本的点数量')
     parser.add_argument('--lr', type=float, default=0.001, help='学习率')
     parser.add_argument('--step_size', type=int, default=20, help='学习率衰减步长')
     parser.add_argument('--gamma', type=float, default=0.5, help='学习率衰减系数')
