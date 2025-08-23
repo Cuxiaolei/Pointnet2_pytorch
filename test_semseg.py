@@ -45,7 +45,15 @@ def random_rotate_for_voting(pc):
                         [0, 0, 1]])
     pc[:, :3] = np.dot(pc[:, :3], rot_mat)  # 仅旋转坐标
     return pc
-
+# 训练时的归一化函数（来自CustomSemSegDataset）
+def pc_normalize(pc):
+    """训练时使用的坐标归一化：中心化并缩放到单位球"""
+    centroid = np.mean(pc, axis=0)  # 计算点云中心
+    pc = pc - centroid  # 中心化（所有点减去中心点坐标）
+    m = np.max(np.sqrt(np.sum(pc **2, axis=1)))  # 计算点到中心的最大距离
+    if m > 0:
+        pc = pc / m  # 缩放到单位球（坐标范围[-1, 1]）
+    return pc
 def parse_args():
     parser = argparse.ArgumentParser('PointNet++ Semantic Segmentation Testing')
     # 与训练代码同步的默认参数
@@ -151,30 +159,27 @@ def main(args):
 
         # 批次处理测试数据
         for batch_idx, (points, target) in enumerate(tqdm(test_loader, desc="测试进度")):
+            # 点云形状：[B, C, N]，其中C=9（坐标3+颜色3+法向量3）
+
+            # 1. 提取坐标通道（前3维），转为numpy
+            points_np = points.numpy()  # [B, C, N]
+            coord = points_np[:, :3, :]  # [B, 3, N]，仅坐标通道
+
+            # 2. 展平坐标后归一化（与训练时单样本处理逻辑一致）
+            coord_flat = coord.reshape(-1, 3)  # [B*N, 3]
+            coord_normalized = pc_normalize(coord_flat)  # 应用与训练相同的归一化
+            points_np[:, :3, :] = coord_normalized.reshape(coord.shape)  # 还原形状
+
+            # 3. 转回Tensor，确保数据类型和设备正确
+            points = torch.FloatTensor(points_np)
             if args.cuda:
                 points = points.cuda()
                 target = target.cuda()
 
-            # 多轮投票
+            # 4. 模型推理（输入形状[B, C, N]，与训练一致）
             pred_sum = None
             for _ in range(args.num_votes):
-                # 对当前批次点云进行轻微随机旋转（复制避免修改原始数据）
-                rotated_points = points.clone()
-                if args.cuda:
-                    rotated_points = rotated_points.cpu().numpy()
-                else:
-                    rotated_points = rotated_points.numpy()
-
-                # 对每个样本应用旋转
-                for b in range(rotated_points.shape[0]):
-                    rotated_points[b] = random_rotate_for_voting(rotated_points[b].T).T  # [C, N] → 旋转 → [C, N]
-
-                rotated_points = torch.FloatTensor(rotated_points)
-                if args.cuda:
-                    rotated_points = rotated_points.cuda()
-
-                # 模型推理（使用旋转后的点云）
-                seg_pred, _ = model(rotated_points)
+                seg_pred, _ = model(points)  # 无需转置，直接使用[B, C, N]
                 if pred_sum is None:
                     pred_sum = seg_pred
                 else:
