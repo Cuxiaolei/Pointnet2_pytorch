@@ -100,7 +100,7 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载线程数')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='权重衰减')
     parser.add_argument('--dataset_root', type=str, default='/root/autodl-tmp/data/data_s3dis_pointNeXt', help='数据集根目录')
-
+    #
     args = parser.parse_args()
     args.cuda = not args.no_cuda and torch.cuda.is_available()
 
