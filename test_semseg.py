@@ -21,7 +21,7 @@ from models import pointnet2_sem_seg
 from data_utils.CustomSemSegDataset import CustomSemSegDataset
 
 # 3分类任务的类别信息（与训练代码保持一致）
-classes = ['class0', 'class1', 'class2']  # 替换为实际类别名称
+classes = ['0', '1', '2']  # 替换为实际类别名称
 class2label = {cls: i for i, cls in enumerate(classes)}
 seg_classes = class2label
 seg_label_to_cat = {i: cat for cat, i in class2label.items()}
@@ -34,14 +34,24 @@ def g_label2color(label):
         [0, 0, 255]     # class2: 蓝色
     ]
     return color_map[label]
-
+# 在测试数据集加载后，添加投票时的随机变换函数
+def random_rotate_for_voting(pc):
+    """投票时的轻微随机旋转（仅绕Z轴）"""
+    theta = np.random.uniform(-np.pi/12, np.pi/12)  # 小角度旋转
+    cosz = np.cos(theta)
+    sinz = np.sin(theta)
+    rot_mat = np.array([[cosz, -sinz, 0],
+                        [sinz, cosz, 0],
+                        [0, 0, 1]])
+    pc[:, :3] = np.dot(pc[:, :3], rot_mat)  # 仅旋转坐标
+    return pc
 
 def parse_args():
     parser = argparse.ArgumentParser('PointNet++ Semantic Segmentation Testing')
     # 与训练代码同步的默认参数
     parser.add_argument('--batch_size', type=int, default=4, help='批次大小')
     parser.add_argument('--gpu', type=str, default='0', help='指定GPU设备')
-    parser.add_argument('--num_point', type=int, default=8192, help='每个样本的点数量')
+    parser.add_argument('--num_point', type=int, default=10000, help='每个样本的点数量')
     parser.add_argument('--log_dir', type=str, default='custom_sem_seg_logs', help='日志和模型根目录')
     parser.add_argument('--visual', action='store_true', default=False, help='是否可视化结果')
     parser.add_argument('--num_votes', type=int, default=3, help='投票聚合次数')
@@ -148,8 +158,23 @@ def main(args):
             # 多轮投票
             pred_sum = None
             for _ in range(args.num_votes):
-                # 模型推理
-                seg_pred, _ = model(points.transpose(2, 1))  # [B, C, N]
+                # 对当前批次点云进行轻微随机旋转（复制避免修改原始数据）
+                rotated_points = points.clone()
+                if args.cuda:
+                    rotated_points = rotated_points.cpu().numpy()
+                else:
+                    rotated_points = rotated_points.numpy()
+
+                # 对每个样本应用旋转
+                for b in range(rotated_points.shape[0]):
+                    rotated_points[b] = random_rotate_for_voting(rotated_points[b].T).T  # [C, N] → 旋转 → [C, N]
+
+                rotated_points = torch.FloatTensor(rotated_points)
+                if args.cuda:
+                    rotated_points = rotated_points.cuda()
+
+                # 模型推理（使用旋转后的点云）
+                seg_pred, _ = model(rotated_points)
                 if pred_sum is None:
                     pred_sum = seg_pred
                 else:
@@ -159,7 +184,7 @@ def main(args):
             seg_pred = pred_sum / args.num_votes
             pred_choice = seg_pred.contiguous().cpu().data.max(1)[1].numpy()  # [B, N]
             target_np = target.cpu().numpy()  # [B, N]
-            points_np = points.cpu().numpy()  # [B, N, 3]
+            points_np = points[:, :3, :].cpu().numpy().transpose(0, 2, 1)  # [B, N, 3]  # [B, N, 3]
 
             # 收集结果
             all_preds.append(pred_choice)
