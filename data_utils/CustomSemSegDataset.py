@@ -90,9 +90,9 @@ class CustomSemSegDataset(Dataset):
     def _compute_label_weights(self):
         cache_file = os.path.join(self.root, f'{self.split}_label_weights.npy')
         if os.path.exists(cache_file):
-            os.remove(cache_file)  # 删除旧缓存，确保新权重生效
+            os.remove(cache_file)
 
-        # 1. 统计所有类别的总点数（采样10%点，兼顾效率）
+        # 1. 统计类别计数（同之前）
         all_labels = []
         for path in self.scene_paths:
             data = np.load(path, mmap_mode='r')
@@ -101,16 +101,16 @@ class CustomSemSegDataset(Dataset):
             all_labels.append(data[indices, 9].astype(np.int32))
             del data
         all_labels = np.concatenate(all_labels)
-
-        # 2. 计算激进权重：总点数 / 类别点数（类别越少，权重越大）
         cls_counts = np.bincount(all_labels, minlength=3)
         total_counts = cls_counts.sum()
-        self.label_weights = total_counts / (cls_counts + 1e-6)  # 避免除零
-        # 归一化权重（防止权重过大导致训练不稳定）
-        self.label_weights = self.label_weights / self.label_weights.max() * 10  # 最大权重设为10
+
+        # 2. 温和权重计算：(总计数/类别计数) 的平方根（降低权重差异）
+        self.label_weights = np.sqrt(total_counts / (cls_counts + 1e-6))
+        # 归一化：最大权重设为5（之前是10，进一步降低激进程度）
+        self.label_weights = self.label_weights / self.label_weights.max() * 5
 
         np.save(cache_file, self.label_weights)
-        print(f"类别权重：{self.label_weights}")  # 确保类别2权重最大（如[3.5, 1.8, 5.2]）
+        print(f"温和类别权重：{self.label_weights}")  # 示例：类别1=1.0，类别0=1.5，类别2=2.0（差异缩小）
         return self.label_weights
 
 
@@ -177,35 +177,57 @@ class CustomSemSegDataset(Dataset):
 
     def _stratified_sampling(self, labels, num_samples):
         unique_labels = np.unique(labels)
-        num_classes = len(unique_labels)
+        # 1. 按“原始分布+最低占比”分配点数（核心调整）
+        # 类别占比配置：类别1最低40%，类别2最低25%，类别0占剩余
+        cls_min_ratio = {0: 0.0, 1: 0.4, 2: 0.25}  # 仅对类别1、2设最低占比
+        cls_min_points = {cls: int(num_samples * ratio) for cls, ratio in cls_min_ratio.items()}
 
-        # 1. 每个类别平均分配点数（如8192点→3类各2730/2731点）
-        base_points = num_samples // num_classes
-        remain_points = num_samples % num_classes
-        samples_per_cls = {cls: base_points for cls in unique_labels}
-        # 剩余点数随机分给前N个类，保证总数达标
-        for cls in list(unique_labels)[:remain_points]:
-            samples_per_cls[cls] += 1
+        # 2. 计算每个类别的原始点数和占比（用于参考）
+        cls_counts = {cls: np.sum(labels == cls) for cls in unique_labels}
+        total_counts = sum(cls_counts.values())
+        cls_origin_ratio = {cls: cnt / total_counts for cls, cnt in cls_counts.items()}
 
+        # 3. 分配点数：取“最低占比点数”和“原始比例点数”的最大值
+        samples_per_cls = {}
+        for cls in unique_labels:
+            # 按原始比例应分配的点数
+            origin_points = int(num_samples * cls_origin_ratio[cls])
+            # 实际分配点数：取“最低点数”和“原始比例点数”的最大值
+            samples_per_cls[cls] = max(cls_min_points.get(cls, 0), origin_points)
+
+        # 4. 调整总点数（若超过num_samples，按比例缩减）
+        total_assigned = sum(samples_per_cls.values())
+        if total_assigned > num_samples:
+            # 按当前分配比例缩减，保证相对平衡
+            scale = num_samples / total_assigned
+            samples_per_cls = {cls: max(1, int(points * scale)) for cls, points in samples_per_cls.items()}
+        # 若仍不足，补到num_samples
+        total_final = sum(samples_per_cls.values())
+        if total_final < num_samples:
+            diff = num_samples - total_final
+            for cls in unique_labels:
+                if diff <= 0:
+                    break
+                samples_per_cls[cls] += 1
+                diff -= 1
+
+        # 5. 执行采样（同之前逻辑，处理点数不足）
         indices = []
         for cls in unique_labels:
-            # 提取当前类的所有点索引
             cls_indices = np.where(labels == cls)[0]
             available = len(cls_indices)
             need = samples_per_cls[cls]
 
             if available >= need:
-                # 点数充足：随机采need个
                 selected = np.random.choice(cls_indices, need, replace=False)
             else:
-                # 点数不足：先取全部，剩余重复采样（保证数量）
                 selected = np.concatenate([
                     cls_indices,
                     np.random.choice(cls_indices, need - available, replace=True)
                 ])
             indices.extend(selected)
 
-        # 打乱顺序，避免同类点聚集
+        # 打乱顺序
         indices = np.array(indices)
         np.random.shuffle(indices)
         return indices
