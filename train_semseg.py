@@ -148,6 +148,16 @@ def main():
 
     logger.info(f"训练集样本数: {len(TRAIN_DATASET)}, 验证集样本数: {len(VAL_DATASET)}")
 
+    # 加载数据集后，添加验证集类别分布统计
+    logger.info("统计验证集类别分布...")
+    val_label_counts = np.zeros(NUM_CLASSES, dtype=int)
+    for points, labels in val_loader:
+        labels_np = labels.numpy().flatten()
+        unique, counts = np.unique(labels_np, return_counts=True)
+        for u, c in zip(unique, counts):
+            val_label_counts[u] += c
+    logger.info(f"验证集总类别分布: {dict(zip(range(NUM_CLASSES), val_label_counts))}")
+
     # 初始化模型
     # 在模型初始化部分修改损失函数的创建方式
     if args.model == 'pointnet2_sem_seg':
@@ -220,6 +230,12 @@ def main():
             all_preds.append(pred_choice.cpu().numpy())
             all_targets.append(target.cpu().numpy())
 
+            if i % 10 == 0:  # 每10个batch打印一次
+                target_np = target.cpu().numpy().flatten()
+                unique, counts = np.unique(target_np, return_counts=True)
+                batch_dist = dict(zip(unique, counts))
+                logger.info(f"训练Batch {i} 类别分布: {batch_dist}")
+
 
         # 计算平均损失和准确率
         avg_loss = total_loss / len(train_loader.dataset)
@@ -284,6 +300,13 @@ def main():
         logger.info(f"  损失: {avg_loss:.4f}, 准确率: {avg_acc:.4f}")
         logger.info(f"  每个类别的IOU: {[f'{iou:.4f}' for iou in class_ious]}")
         logger.info(f"  平均IOU: {miou:.4f}")
+
+        if i % 10 == 0:
+            target_np = target.cpu().numpy().flatten()
+            unique, counts = np.unique(target_np, return_counts=True)
+            batch_dist = dict(zip(unique, counts))
+            logger.info(f"验证Batch {i} 类别分布: {batch_dist}")
+
 
         return avg_loss, avg_acc, miou
 

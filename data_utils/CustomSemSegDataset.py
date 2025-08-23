@@ -117,8 +117,13 @@ class CustomSemSegDataset(Dataset):
         self.label_weights = self.label_weights / np.sum(self.label_weights)
         self.label_weights = 1.0 / (np.log(1.2 + self.label_weights))
 
+        self.label_weights = 1.0 / (np.log(1.2 + self.label_weights))
+        # 打印权重
+        print(f"类别权重: {self.label_weights}")  # 索引0、1、2对应三个类别
         # 保存缓存
         np.save(cache_file, self.label_weights)
+
+
 
     def __len__(self):
         return len(self.scene_paths)
@@ -170,6 +175,13 @@ class CustomSemSegDataset(Dataset):
             repeat = self.num_point // points.shape[0] + 1
             points = np.tile(points, (repeat, 1))[:self.num_point, :]
             labels = np.tile(labels, (repeat,))[:self.num_point]
+
+            # 最终采样后，添加类别分布日志
+        unique, counts = np.unique(labels, return_counts=True)
+        label_dist = dict(zip(unique, counts))
+        # 只在调试时打印，避免日志过多（可每100个样本打印一次）
+        if idx % 100 == 0:
+            print(f"样本{idx}类别分布: {label_dist}")  # 后续可改为logger.info
 
         # 转换为Tensor (模型期望的形状是 [C, N])
         points = torch.FloatTensor(points.T)
